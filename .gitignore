@@ -1,4 +1,6 @@
 # Current project
+*.keyed
+*.npy
 /*.json
 .idea
 data/

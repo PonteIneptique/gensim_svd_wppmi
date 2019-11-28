@@ -1,29 +1,45 @@
+from logging import getLogger
+from collections import Counter
+from typing import Tuple
+from types import GeneratorType
+
+from sklearn.decomposition import TruncatedSVD
+import scipy.sparse
+import numpy as np
+
 from gensim.models.base_any2vec import BaseWordEmbeddingsModel
 from gensim.models.keyedvectors import WordEmbeddingsKeyedVectors, Vocab
 from gensim.corpora.textcorpus import TextCorpus
 from gensim.utils import SaveLoad
-from logging import getLogger
-from collections import Counter
+
 from tqdm import tqdm
-from typing import Tuple
-from types import GeneratorType
-import scipy.sparse
-import numpy as np
+from multiprocessing.pool import Pool
 
 logger = getLogger(__name__)
 
 
 class SvdWppmiVocabulary(SaveLoad):
-    def __init__(self, min_count: int = 0):
+    def __init__(self, min_count: int = 0, workers: int = 3):
         self.min_count = min_count
+        self.workers = workers
         self.raw_vocab = Counter()
+
+    @staticmethod
+    def _multi_counters(tokens) -> Tuple[Counter, int]:
+        return Counter(tokens), len(tokens)
 
     def _scan_vocab(self, sentences: TextCorpus) -> Tuple[int, int]:
         total_words, corpus_count = 0, 0
-        for sentence in tqdm(sentences.get_texts()):
-            self.raw_vocab.update(Counter(sentence))
-            corpus_count += 1
-            total_words += len(sentence)
+
+        with Pool(processes=self.workers) as pool:
+            for doc_counter, doc_length in tqdm(pool.imap_unordered(
+                    func=SvdWppmiVocabulary._multi_counters,
+                    iterable=sentences.get_texts()
+            ), total=len(sentences)):
+                self.raw_vocab.update(doc_counter)
+                corpus_count += 1
+                total_words += doc_length
+
         return total_words, corpus_count
 
     def scan_vocab(self, sentences=None, *args, **kwargs):
@@ -72,9 +88,10 @@ class SVD_WPPMI(BaseWordEmbeddingsModel):
     def __init__(
             self, sentences=None, workers=3, vector_size=100, window=5):
 
-        self.vocabulary = SvdWppmiVocabulary()
         self.window = window
         self.vector_size = vector_size
+        self.workers = workers
+        self.vocabulary = SvdWppmiVocabulary(workers=self.workers)
         self.wv = WordEmbeddingsKeyedVectors(vector_size=self.vector_size)
 
         if sentences is not None:
@@ -95,26 +112,34 @@ class SVD_WPPMI(BaseWordEmbeddingsModel):
         total_words, corpus_count = self.vocabulary.scan_vocab(sentences)
         self.corpus_count = corpus_count
         self.corpus_total_words = total_words
-        print(self.vocabulary.prepare_vocab(self.wv, dry_run=dry_run))
+        self.vocabulary.prepare_vocab(self.wv, dry_run=dry_run)
 
-    def _coocurence_matrix(self, sentences: TextCorpus, threshold=0.7):
+    def _multiproc_cooc(self, sentence):
+        matrix_size = len(self.wv.index2word)
+        C = scipy.sparse.csc_matrix((matrix_size, matrix_size), dtype=np.float32)
+        tokens = self.tokens_2_index(sentence)
+        for k in range(1, self.window + 1):
+            logger.info(u"Counting pairs (i, i \u00B1 {:d}) ...".format(k))
+            i = tokens[:-k]  # current word
+            j = tokens[k:]  # k words ahead
+            data = (np.ones_like(i), (i, j))  # values, indices
+
+            C += scipy.sparse.csc_matrix(data, shape=C.shape, dtype=np.float32)
+        return C
+
+    def _coocurence_matrix(self, sentences: TextCorpus):
         # https://github.com/johndpope/summerschool/blob/master/assignment/classifier/3-Embeddings_SVD_Viz.ipynb
         matrix_size = len(self.wv.index2word)
         C = scipy.sparse.csc_matrix((matrix_size, matrix_size), dtype=np.float32)
 
-        print("Scanning for pairs")
-        for sentence in tqdm(sentences.get_texts(), total=self.corpus_count):
-            tokens = self.tokens_2_index(sentence)
-            for k in range(1, self.window + 1):
-                logger.info(u"Counting pairs (i, i \u00B1 {:d}) ...".format(k))
-                i = tokens[:-k]  # current word
-                j = tokens[k:]  # k words ahead
-                data = (np.ones_like(i), (i, j))  # values, indices
-
-                Ck_plus = scipy.sparse.csc_matrix(data, shape=C.shape, dtype=np.float32)
-                Ck_minus = Ck_plus.T  # Consider k words behind
-                C += Ck_plus + Ck_minus
-
+        with Pool(processes=self.workers) as pool:
+            for doc_C in tqdm(pool.imap_unordered(
+                    func=self._multiproc_cooc,
+                    iterable=sentences.get_texts()
+            ), total=len(sentences)):
+                C += doc_C
+        # Les décomptes totaux sont égaux à la
+        C = C + C.T
         print()
         print("Co-occurrence matrix: {:,} words x {:,} words".format(*C.shape))
         print("  {:.02g} nonzero elements".format(C.nnz))
@@ -136,10 +161,11 @@ class SVD_WPPMI(BaseWordEmbeddingsModel):
         total_row = np.array(cooc_matrix.sum(axis=1), dtype=np.float64).flatten()
 
         # Get indices of relevant elements
+        # As there is no addition, it is useless to overload computation with 0*something
+        #  As such, we retrieve indexes of things that do not have 0s
+        #  And we will rebuild the return matrix using them
         ii, jj = cooc_matrix.nonzero()  # row, column indices
-        print(ii)
         Cij = np.array(cooc_matrix[ii, jj], dtype=np.float64).flatten()
-        print(Cij)
         ##
         # PMI equation
         pmi = np.log(Cij * total / (total_row[ii] * total_column[jj]))
@@ -153,21 +179,26 @@ class SVD_WPPMI(BaseWordEmbeddingsModel):
         ret.eliminate_zeros()  # remove zeros
         return ret
 
-    def train(self, sentences: TextCorpus) -> Tuple[scipy.sparse.csc_matrix]:
+    def _svd(self, ppmi):
+        """Returns word vectors from SVD.
+
+        Args:
+          X: m x n matrix
+          d: word vector dimension
+
+        Returns:
+          Wv : m x d matrix, each row is a word vector.
+        """
+        transformer = TruncatedSVD(n_components=self.vector_size, random_state=None)
+        Wv = transformer.fit_transform(ppmi)
+        # Normalize to unit length
+        Wv = Wv / np.linalg.norm(Wv, axis=1).reshape([-1, 1])
+        return Wv, transformer.explained_variance_
+
+    def train(self, sentences: TextCorpus) -> Tuple[np.array, scipy.sparse.csc_matrix, scipy.sparse.csc_matrix]:
         # Build co-occurence matrix
         cooc_matrix = self._coocurence_matrix(sentences)
         ppmi = self._ppmi(cooc_matrix)
-        return cooc_matrix,
-
-
-if __name__ == "__main__":
-    from gensim.corpora.textcorpus import TextDirectoryCorpus
-    logger.setLevel("INFO")
-
-    corpus = TextDirectoryCorpus("../data")
-    vecs = SVD_WPPMI(sentences=corpus)
-    cooc_matrix, = vecs.train(sentences=corpus)
-
-    lasciv, = vecs.tokens_2_index(["lascivvs"])
-    assert cooc_matrix.getrow(lasciv).todense().tolist() == \
-           cooc_matrix.getcol(lasciv).transpose().todense().tolist()
+        vectors, variance = self._svd(ppmi)
+        self.wv.vectors = vectors
+        return vectors, cooc_matrix, ppmi
